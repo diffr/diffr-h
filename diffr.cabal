@@ -1,0 +1,17 @@
+Name:               diffr
+Version:            0.0
+Description:        Intelligent diff/patch tool that knows how to copy and move, has an 'r' at the end of its name.
+License:            GPL-3
+License-file:       LICENCE
+Author:             Amaury Couste, Jakub Kozlowski, William Martin
+Maintainer:
+Build-Type:         Simple
+Cabal-Version:      >=1.2
+
+Executable diffr
+  Main-is:          diff/Main.hs
+  Build-Depends:    base
+
+Executable patchr
+  Main-is:          patch/Main.hs
+  Build-Depends:    base
