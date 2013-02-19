@@ -1,7 +1,7 @@
 {- |
- Module      :  Patchr.Main
+ Module      :  Main
  Description :  Main entry point for patchr.
- Since       :  0.0
+ Since       :  0.1
  Authors     :  William Martin
  License     :  This file is part of diffr-h.
 
@@ -18,7 +18,7 @@
  along with diffr-h.  If not, see <http://www.gnu.org/licenses/>.
 -}
 
-module Patchr.Main where
+module Main where
 
 import System.Environment
 

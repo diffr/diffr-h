@@ -9,9 +9,11 @@ Build-Type:         Simple
 Cabal-Version:      >=1.2
 
 Executable diffr
-  Main-is:          diff/Main.hs
-  Build-Depends:    base
+  Main-is:          src/diffr/diff/Main.hs
+  Build-Depends:    base >= 4
+  ghc-options: -Wall
 
 Executable patchr
-  Main-is:          patch/Main.hs
-  Build-Depends:    base
+  Main-is:          src/diffr/patch/Main.hs
+  Build-Depends:    base >= 4
+  ghc-options: -Wall

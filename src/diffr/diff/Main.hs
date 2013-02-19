@@ -1,7 +1,7 @@
 {- |
- Module      :  Diffr.Main
+ Module      :  Main
  Description :  Main entry point for diffr.
- Since       :  0.0
+ Since       :  0.1
  Authors     :  William Martin
  License     :  This file is part of diffr-h.
 
@@ -18,12 +18,27 @@
  along with diffr-h.  If not, see <http://www.gnu.org/licenses/>.
 -}
 
-module Diffr.Main where
+module Main ( main ) where
 
-import System.Environment
+import System.Environment( getArgs )
+import System.Exit ( exitFailure, exitSuccess )
 
 -- | 'main' runs the main program
 main :: IO ()
-main = print usage
+main = do
+    args <- getArgs
+    if not ( 2 == length args || 4 == length args )
+      then do
+        printUsage
+        exitFailure
+      else do
+        print ( length args )
+        exitSuccess
 
-usage = "diffr says hello"
+
+
+-- | 'printUsage' prints the usage information for diffr.
+printUsage :: IO ()
+printUsage = putStrLn ( "Usage: \n" ++
+                   "    diffr <original-file> <new-file>\n" ++
+                   "    diffr <original-file> <new-file> -o <output-file>" )
