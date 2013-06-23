@@ -1,8 +1,9 @@
+{-# LANGUAGE DeriveDataTypeable, RecordWildCards #-}
 {- |
  Module      :  Main
  Description :  Main entry point for diffr.
  Since       :  0.1
- Authors     :  William Martin
+ Authors     :  William Martin, Jakub Kozlowski
  License     :  This file is part of diffr-h.
 
  diffr-h is free software: you can redistribute it and/or modify
@@ -18,27 +19,15 @@
  along with diffr-h.  If not, see <http://www.gnu.org/licenses/>.
 -}
 
-module Main ( main ) where
+module Main(main) where
 
-import System.Environment( getArgs )
-import System.Exit ( exitFailure, exitSuccess )
+import System.Environment ( getArgs, withArgs )
+import qualified System.Console.CmdArgs as CM 
+import qualified Diffr.Util as DU
 
--- | 'main' runs the main program
 main :: IO ()
 main = do
     args <- getArgs
-    if not ( 2 == length args || 4 == length args )
-      then do
-        printUsage
-        exitFailure
-      else do
-        print ( length args )
-        exitSuccess
-
-
-
--- | 'printUsage' prints the usage information for diffr.
-printUsage :: IO ()
-printUsage = putStrLn ( "Usage: \n" ++
-                   "    diffr <original-file> <new-file>\n" ++
-                   "    diffr <original-file> <new-file> -o <output-file>" )
+    -- If the user did not specify any arguments, pretend as "--help" was given
+    opts <- (if null args then withArgs ["--help"] else id) $ CM.cmdArgsRun DU.diffrModes
+    print opts
