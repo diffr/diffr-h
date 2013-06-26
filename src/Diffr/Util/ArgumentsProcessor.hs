@@ -24,16 +24,21 @@ import Data.Char ( toLower )
 
 -- | 'containsHelpArgument' checks if the given list of strings contains the help argument.
 containsHelpArgument :: [[Char]] -> Bool
-containsHelpArgument args = any isHelpArgument args
+containsHelpArgument args = any isHelpArgument ( map ( map toLower ) args )
 
 -- | 'extractOutputFile' extracts the output file argument from a list of strings.
 extractOutputFile :: [[Char]] -> [Char]
-extractOutputFile args
-    | "-o" == head args = head ( tail args )
-    | otherwise = extractOutputFile ( tail args )
+extractOutputFile args = case args of
+    [] -> ""
+    ("-o":[]) -> ""
+    ("-o":xs) -> head ( xs )
+    _ -> extractOutputFile ( tail args )
 
 -- | 'isHelpArgument' checks if a string is a help argument.
 isHelpArgument :: [Char] -> Bool
-isHelpArgument arg
-    | '-' == ( head arg ) = isHelpArgument( tail arg )
-    | otherwise = "help" == ( map toLower arg )
+isHelpArgument arg = case arg of
+    [] -> False
+    ('-':[]) -> False
+    ('-':xs) -> isHelpArgument( xs )
+    "help" -> True
+    _ -> False

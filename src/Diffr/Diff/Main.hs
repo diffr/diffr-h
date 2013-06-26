@@ -20,6 +20,7 @@
 
 module Main ( main ) where
 
+import Data.Char( intToDigit )
 import Diffr.Util.ArgumentsProcessor( containsHelpArgument, extractOutputFile )
 import System.Environment( getArgs )
 import System.Exit ( exitFailure, exitSuccess )
@@ -33,7 +34,7 @@ main = do
         printUsage
         exitFailure
       else do
-        print ( length args )
+        print ( [intToDigit ( length args )]  ++ " arguments" )
         print ( extractOutputFile args )
         exitSuccess
 
