@@ -20,22 +20,23 @@
 
 module Main ( main ) where
 
+import Data.Char( intToDigit )
+import Diffr.Util.ArgumentsProcessor( containsHelpArgument, extractOutputFile )
 import System.Environment( getArgs )
 import System.Exit ( exitFailure, exitSuccess )
 
--- | 'main' runs the main program
+-- | 'main' runs diffr.
 main :: IO ()
 main = do
     args <- getArgs
-    if not ( 2 == length args || 4 == length args )
+    if ( containsHelpArgument args || not ( 2 == length args || 4 == length args ) )
       then do
         printUsage
         exitFailure
       else do
-        print ( length args )
+        print ( [intToDigit ( length args )]  ++ " arguments" )
+        print ( extractOutputFile args )
         exitSuccess
-
-
 
 -- | 'printUsage' prints the usage information for diffr.
 printUsage :: IO ()

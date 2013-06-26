@@ -1,5 +1,5 @@
 Name:               diffr
-Version:            0.0
+Version:            0.2
 Description:        Intelligent diff/patch tool that knows how to copy and move, has an 'r' at the end of its name.
 License:            GPL-3
 License-file:       LICENCE
@@ -8,12 +8,20 @@ Maintainer:
 Build-Type:         Simple
 Cabal-Version:      >=1.2
 
-Executable diffr
-  Main-is:          src/diffr/diff/Main.hs
+Library
   Build-Depends:    base >= 4
-  ghc-options: -Wall
+  Hs-Source-Dirs:   src
+  Exposed-Modules:  Diffr.Util.ArgumentsProcessor
+  ghc-options:      -Wall
+
+Executable diffr
+  Main-is:          Diffr/Diff/Main.hs
+  Build-Depends:    base >= 4
+  Other-Modules:    Diffr.Util.ArgumentsProcessor
+  Hs-Source-Dirs:   src
+  ghc-options:      -Wall
 
 Executable patchr
-  Main-is:          src/diffr/patch/Main.hs
+  Main-is:          src/Diffr/Patch/Main.hs
   Build-Depends:    base >= 4
-  ghc-options: -Wall
+  ghc-options:      -Wall
