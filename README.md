@@ -1,5 +1,7 @@
 diffr-h
 =======
+[![Build Status](https://travis-ci.org/diffr/diffr-h.png)](https://travis-ci.org/diffr/diffr-h)
+
 An intelligent diff/patch tool that knows how to copy and move, has an 'r' at the end of its name and is written in Haskell.
 
 * See AUTHORS for the details on who contributed to this awesome project.
