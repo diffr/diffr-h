@@ -1,8 +1,17 @@
 Installation Instructions
 =========================
-This program is written in Haskell and built using cabal.  
+
+This program is written in Haskell and built using (cabal)[http://www.haskell.org/cabal/].  
+
+It is suggested that (cabal-dev)[http://hackage.haskell.org/package/cabal-dev] be used as
+it provides a sandboxed, per-project dependency management, which leads to less issues with
+conflicting library versions. 
+
 To build, you will need:
 * haskell-platform
+* cabal (or cabal-dev)
+
+If you're on a mac, check out (homebrew)[http://mxcl.github.io/homebrew/].
 
 #### Building
 
@@ -19,7 +28,7 @@ Optionally:
 #### Testing
 
 1. Run "cabal clean".
-2. Run "cabal configure".
+2. Run "cabal configure --enable-tests".
 3. Run "cabal build" to compile the sources to dist/.
 4. Run "cabal test" to run the tests.
 

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, RecordWildCards #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {- |
  Module      :  Main
  Description :  Main entry point for Diffr.
@@ -21,9 +21,9 @@
 
 module Main(main) where
 
-import System.Environment ( getArgs, withArgs )
-import qualified System.Console.CmdArgs as CM 
-import qualified Diffr.Util as DU
+import qualified Diffr.Util             as DU
+import qualified System.Console.CmdArgs as CM
+import           System.Environment     (getArgs, withArgs)
 
 main :: IO ()
 main = do
