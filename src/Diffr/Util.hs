@@ -20,13 +20,13 @@
 -}
 module Diffr.Util (
       DConfig(..)
-    , diffrModes 
+    , diffrModes
 ) where
 
-import System.Console.CmdArgs
+import           System.Console.CmdArgs
 
 {-| Static values -}
-_PROGRAM_NAME, _PROGRAM_VERSION, 
+_PROGRAM_NAME, _PROGRAM_VERSION,
  _PROGRAM_INFO, _PROGRAM_ABOUT, _COPYRIGHT :: String
 _PROGRAM_NAME = "diffr"
 _PROGRAM_VERSION = "0.1"
@@ -43,48 +43,48 @@ _COPYRIGHT = "(C) diffr 2013"
 {-| Configuration for running diffr's commands -}
 data DConfig =
 
-    -- | Configuration for running diff command 
-    Diff  { -- | Path to the 'base' file we will diff against 
+    -- | Configuration for running diff command
+    Diff  { -- | Path to the 'base' file we will diff against
             baseFile     :: FilePath
-  
-            -- | Path to the 'new' file we will compare to 'base' file 
-          , newFile    :: FilePath  
-         
+
+            -- | Path to the 'new' file we will compare to 'base' file
+          , newFile    :: FilePath
+
             -- | Path to the output file where to write the diff file
           , dOutFile    :: Maybe FilePath
           }
-        
-    -- | Configuration for running patch command       
+
+    -- | Configuration for running patch command
   | Patch { -- | Path to the 'original' file we will apply patch to
             originalFile :: FilePath
-          
+
             -- | Path to the 'patch' file we will apply to 'originalFile'
           , patchFile  :: FilePath
-          
+
             -- | Path to the output file where to write the patched file
           , pOutFile    :: Maybe FilePath
-          } deriving (Show, Data, Typeable)
+          } deriving (Eq, Show, Data, Typeable)
 
 {-| Annotate the 'Diff' configuration -}
 diff :: DConfig
 diff = Diff
-    { baseFile  = def &= argPos 0 
-                      &= typ "BASEFILE"    
-    , newFile   = def &= argPos 1 
-                      &= typ "NEWFILE"     
-    , dOutFile  = def &= help "path to the output file"                                      
+    { baseFile  = def &= argPos 0
+                      &= typ "BASEFILE"
+    , newFile   = def &= argPos 1
+                      &= typ "NEWFILE"
+    , dOutFile  = def &= help "path to the output file"
                       &= name "output-file" &= typFile
     }
-                
+
 {-| Annotate the 'Patch' configuration -}
 patch :: DConfig
 patch = Patch
-    { originalFile  = def &= argPos 0 
-                          &= typ "ORIGINALFILE"              
+    { originalFile  = def &= argPos 0
+                          &= typ "ORIGINALFILE"
     , patchFile     = def &= argPos 1
-                          &= typ "PATCHFILE"        
-    , pOutFile      = def &= help "Path to the output file where to write the patched file"  
-                          &= name "output-file"   
+                          &= typ "PATCHFILE"
+    , pOutFile      = def &= help "Path to the output file where to write the patched file"
+                          &= name "output-file"
                           &= typFile
     }
 
@@ -96,4 +96,4 @@ diffrModes = cmdArgsMode $ modes [diff, patch]
     &= help _PROGRAM_ABOUT
     &= helpArg [explicit, name "help", name "h"]
     &= program _PROGRAM_NAME
-             
+
