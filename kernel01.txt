@@ -1,0 +1,2585 @@
+/*
+ *	console.c
+ *
+ * This module implements the console io functions
+ *	'void con_init(void)'
+ *	'void con_write(struct tty_queue * queue)'
+ * Hopefully this will be a rather complete VT102 implementation.
+ *
+ */
+
+/*
+ *  NOTE!!! We sometimes disable and enable interrupts for a short while
+ * (to put a word in video IO), but this will work even for keyboard
+ * interrupts. We know interrupts aren't enabled when getting a keyboard
+ * interrupt, as we use trap-gates. Hopefully all is well.
+ */
+
+#include <linux/sched.h>
+#include <linux/tty.h>
+#include <asm/io.h>
+#include <asm/system.h>
+
+#define SCREEN_START 0xb8000
+#define SCREEN_END   0xc0000
+#define LINES 25
+#define COLUMNS 80
+#define NPAR 16
+
+extern void keyboard_interrupt(void);
+
+static unsigned long origin=SCREEN_START;
+static unsigned long scr_end=SCREEN_START+LINES*COLUMNS*2;
+static unsigned long pos;
+static unsigned long x,y;
+static unsigned long top=0,bottom=LINES;
+static unsigned long lines=LINES,columns=COLUMNS;
+static unsigned long state=0;
+static unsigned long npar,par[NPAR];
+static unsigned long ques=0;
+static unsigned char attr=0x07;
+
+/*
+ * this is what the terminal answers to a ESC-Z or csi0c
+ * query (= vt100 response).
+ */
+#define RESPONSE "\033[?1;2c"
+
+static inline void gotoxy(unsigned int new_x,unsigned int new_y)
+{
+	if (new_x>=columns || new_y>=lines)
+		return;
+	x=new_x;
+	y=new_y;
+	pos=origin+((y*columns+x)<<1);
+}
+
+static inline void set_origin(void)
+{
+	cli();
+	outb_p(12,0x3d4);
+	outb_p(0xff&((origin-SCREEN_START)>>9),0x3d5);
+	outb_p(13,0x3d4);
+	outb_p(0xff&((origin-SCREEN_START)>>1),0x3d5);
+	sti();
+}
+
+static void scrup(void)
+{
+	if (!top && bottom==lines) {
+		origin += columns<<1;
+		pos += columns<<1;
+		scr_end += columns<<1;
+		if (scr_end>SCREEN_END) {
+			__asm__("cld\n\t"
+				"rep\n\t"
+				"movsl\n\t"
+				"movl _columns,%1\n\t"
+				"rep\n\t"
+				"stosw"
+				::"a" (0x0720),
+				"c" ((lines-1)*columns>>1),
+				"D" (SCREEN_START),
+				"S" (origin)
+				:"cx","di","si");
+			scr_end -= origin-SCREEN_START;
+			pos -= origin-SCREEN_START;
+			origin = SCREEN_START;
+		} else {
+			__asm__("cld\n\t"
+				"rep\n\t"
+				"stosl"
+				::"a" (0x07200720),
+				"c" (columns>>1),
+				"D" (scr_end-(columns<<1))
+				:"cx","di");
+		}
+		set_origin();
+	} else {
+		__asm__("cld\n\t"
+			"rep\n\t"
+			"movsl\n\t"
+			"movl _columns,%%ecx\n\t"
+			"rep\n\t"
+			"stosw"
+			::"a" (0x0720),
+			"c" ((bottom-top-1)*columns>>1),
+			"D" (origin+(columns<<1)*top),
+			"S" (origin+(columns<<1)*(top+1))
+			:"cx","di","si");
+	}
+}
+
+static void scrdown(void)
+{
+	__asm__("std\n\t"
+		"rep\n\t"
+		"movsl\n\t"
+		"addl $2,%%edi\n\t"	/* %edi has been decremented by 4 */
+		"movl _columns,%%ecx\n\t"
+		"rep\n\t"
+		"stosw"
+		::"a" (0x0720),
+		"c" ((bottom-top-1)*columns>>1),
+		"D" (origin+(columns<<1)*bottom-4),
+		"S" (origin+(columns<<1)*(bottom-1)-4)
+		:"ax","cx","di","si");
+}
+
+static void lf(void)
+{
+	if (y+1<bottom) {
+		y++;
+		pos += columns<<1;
+		return;
+	}
+	scrup();
+}
+
+static void ri(void)
+{
+	if (y>top) {
+		y--;
+		pos -= columns<<1;
+		return;
+	}
+	scrdown();
+}
+
+static void cr(void)
+{
+	pos -= x<<1;
+	x=0;
+}
+
+static void del(void)
+{
+	if (x) {
+		pos -= 2;
+		x--;
+		*(unsigned short *)pos = 0x0720;
+	}
+}
+
+static void csi_J(int par)
+{
+	long count __asm__("cx");
+	long start __asm__("di");
+
+	switch (par) {
+		case 0:	/* erase from cursor to end of display */
+			count = (scr_end-pos)>>1;
+			start = pos;
+			break;
+		case 1:	/* erase from start to cursor */
+			count = (pos-origin)>>1;
+			start = origin;
+			break;
+		case 2: /* erase whole display */
+			count = columns*lines;
+			start = origin;
+			break;
+		default:
+			return;
+	}
+	__asm__("cld\n\t"
+		"rep\n\t"
+		"stosw\n\t"
+		::"c" (count),
+		"D" (start),"a" (0x0720)
+		:"cx","di");
+}
+
+static void csi_K(int par)
+{
+	long count __asm__("cx");
+	long start __asm__("di");
+
+	switch (par) {
+		case 0:	/* erase from cursor to end of line */
+			if (x>=columns)
+				return;
+			count = columns-x;
+			start = pos;
+			break;
+		case 1:	/* erase from start of line to cursor */
+			start = pos - (x<<1);
+			count = (x<columns)?x:columns;
+			break;
+		case 2: /* erase whole line */
+			start = pos - (x<<1);
+			count = columns;
+			break;
+		default:
+			return;
+	}
+	__asm__("cld\n\t"
+		"rep\n\t"
+		"stosw\n\t"
+		::"c" (count),
+		"D" (start),"a" (0x0720)
+		:"cx","di");
+}
+
+void csi_m(void)
+{
+	int i;
+
+	for (i=0;i<=npar;i++)
+		switch (par[i]) {
+			case 0:attr=0x07;break;
+			case 1:attr=0x0f;break;
+			case 4:attr=0x0f;break;
+			case 7:attr=0x70;break;
+			case 27:attr=0x07;break;
+		}
+}
+
+static inline void set_cursor(void)
+{
+	cli();
+	outb_p(14,0x3d4);
+	outb_p(0xff&((pos-SCREEN_START)>>9),0x3d5);
+	outb_p(15,0x3d4);
+	outb_p(0xff&((pos-SCREEN_START)>>1),0x3d5);
+	sti();
+}
+
+static void respond(struct tty_struct * tty)
+{
+	char * p = RESPONSE;
+
+	cli();
+	while (*p) {
+		PUTCH(*p,tty->read_q);
+		p++;
+	}
+	sti();
+	copy_to_cooked(tty);
+}
+
+static void insert_char(void)
+{
+	int i=x;
+	unsigned short tmp,old=0x0720;
+	unsigned short * p = (unsigned short *) pos;
+
+	while (i++<columns) {
+		tmp=*p;
+		*p=old;
+		old=tmp;
+		p++;
+	}
+}
+
+static void insert_line(void)
+{
+	int oldtop,oldbottom;
+
+	oldtop=top;
+	oldbottom=bottom;
+	top=y;
+	bottom=lines;
+	scrdown();
+	top=oldtop;
+	bottom=oldbottom;
+}
+
+static void delete_char(void)
+{
+	int i;
+	unsigned short * p = (unsigned short *) pos;
+
+	if (x>=columns)
+		return;
+	i = x;
+	while (++i < columns) {
+		*p = *(p+1);
+		p++;
+	}
+	*p=0x0720;
+}
+
+static void delete_line(void)
+{
+	int oldtop,oldbottom;
+
+	oldtop=top;
+	oldbottom=bottom;
+	top=y;
+	bottom=lines;
+	scrup();
+	top=oldtop;
+	bottom=oldbottom;
+}
+
+static void csi_at(int nr)
+{
+	if (nr>columns)
+		nr=columns;
+	else if (!nr)
+		nr=1;
+	while (nr--)
+		insert_char();
+}
+
+static void csi_L(int nr)
+{
+	if (nr>lines)
+		nr=lines;
+	else if (!nr)
+		nr=1;
+	while (nr--)
+		insert_line();
+}
+
+static void csi_P(int nr)
+{
+	if (nr>columns)
+		nr=columns;
+	else if (!nr)
+		nr=1;
+	while (nr--)
+		delete_char();
+}
+
+static void csi_M(int nr)
+{
+	if (nr>lines)
+		nr=lines;
+	else if (!nr)
+		nr=1;
+	while (nr--)
+		delete_line();
+}
+
+static int saved_x=0;
+static int saved_y=0;
+
+static void save_cur(void)
+{
+	saved_x=x;
+	saved_y=y;
+}
+
+static void restore_cur(void)
+{
+	x=saved_x;
+	y=saved_y;
+	pos=origin+((y*columns+x)<<1);
+}
+
+void con_write(struct tty_struct * tty)
+{
+	int nr;
+	char c;
+
+	nr = CHARS(tty->write_q);
+	while (nr--) {
+		GETCH(tty->write_q,c);
+		switch(state) {
+			case 0:
+				if (c>31 && c<127) {
+					if (x>=columns) {
+						x -= columns;
+						pos -= columns<<1;
+						lf();
+					}
+					__asm__("movb _attr,%%ah\n\t"
+						"movw %%ax,%1\n\t"
+						::"a" (c),"m" (*(short *)pos)
+						:"ax");
+					pos += 2;
+					x++;
+				} else if (c==27)
+					state=1;
+				else if (c==10 || c==11 || c==12)
+					lf();
+				else if (c==13)
+					cr();
+				else if (c==ERASE_CHAR(tty))
+					del();
+				else if (c==8) {
+					if (x) {
+						x--;
+						pos -= 2;
+					}
+				} else if (c==9) {
+					c=8-(x&7);
+					x += c;
+					pos += c<<1;
+					if (x>columns) {
+						x -= columns;
+						pos -= columns<<1;
+						lf();
+					}
+					c=9;
+				}
+				break;
+			case 1:
+				state=0;
+				if (c=='[')
+					state=2;
+				else if (c=='E')
+					gotoxy(0,y+1);
+				else if (c=='M')
+					ri();
+				else if (c=='D')
+					lf();
+				else if (c=='Z')
+					respond(tty);
+				else if (x=='7')
+					save_cur();
+				else if (x=='8')
+					restore_cur();
+				break;
+			case 2:
+				for(npar=0;npar<NPAR;npar++)
+					par[npar]=0;
+				npar=0;
+				state=3;
+				if (ques=(c=='?'))
+					break;
+			case 3:
+				if (c==';' && npar<NPAR-1) {
+					npar++;
+					break;
+				} else if (c>='0' && c<='9') {
+					par[npar]=10*par[npar]+c-'0';
+					break;
+				} else state=4;
+			case 4:
+				state=0;
+				switch(c) {
+					case 'G': case '`':
+						if (par[0]) par[0]--;
+						gotoxy(par[0],y);
+						break;
+					case 'A':
+						if (!par[0]) par[0]++;
+						gotoxy(x,y-par[0]);
+						break;
+					case 'B': case 'e':
+						if (!par[0]) par[0]++;
+						gotoxy(x,y+par[0]);
+						break;
+					case 'C': case 'a':
+						if (!par[0]) par[0]++;
+						gotoxy(x+par[0],y);
+						break;
+					case 'D':
+						if (!par[0]) par[0]++;
+						gotoxy(x-par[0],y);
+						break;
+					case 'E':
+						if (!par[0]) par[0]++;
+						gotoxy(0,y+par[0]);
+						break;
+					case 'F':
+						if (!par[0]) par[0]++;
+						gotoxy(0,y-par[0]);
+						break;
+					case 'd':
+						if (par[0]) par[0]--;
+						gotoxy(x,par[0]);
+						break;
+					case 'H': case 'f':
+						if (par[0]) par[0]--;
+						if (par[1]) par[1]--;
+						gotoxy(par[1],par[0]);
+						break;
+					case 'J':
+						csi_J(par[0]);
+						break;
+					case 'K':
+						csi_K(par[0]);
+						break;
+					case 'L':
+						csi_L(par[0]);
+						break;
+					case 'M':
+						csi_M(par[0]);
+						break;
+					case 'P':
+						csi_P(par[0]);
+						break;
+					case '@':
+						csi_at(par[0]);
+						break;
+					case 'm':
+						csi_m();
+						break;
+					case 'r':
+						if (par[0]) par[0]--;
+						if (!par[1]) par[1]=lines;
+						if (par[0] < par[1] &&
+						    par[1] <= lines) {
+							top=par[0];
+							bottom=par[1];
+						}
+						break;
+					case 's':
+						save_cur();
+						break;
+					case 'u':
+						restore_cur();
+						break;
+				}
+		}
+	}
+	set_cursor();
+}
+
+/*
+ *  void con_init(void);
+ *
+ * This routine initalizes console interrupts, and does nothing
+ * else. If you want the screen to clear, call tty_write with
+ * the appropriate escape-sequece.
+ */
+void con_init(void)
+{
+	register unsigned char a;
+
+	gotoxy(*(unsigned char *)(0x90000+510),*(unsigned char *)(0x90000+511));
+	set_trap_gate(0x21,&keyboard_interrupt);
+	outb_p(inb_p(0x21)&0xfd,0x21);
+	a=inb_p(0x61);
+	outb_p(a|0x80,0x61);
+	outb(a,0x61);
+}
+#include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <linux/tty.h>
+#include <asm/segment.h>
+
+int sys_pause(void);
+int sys_close(int fd);
+
+void release(struct task_struct * p)
+{
+	int i;
+
+	if (!p)
+		return;
+	for (i=1 ; i<NR_TASKS ; i++)
+		if (task[i]==p) {
+			task[i]=NULL;
+			free_page((long)p);
+			schedule();
+			return;
+		}
+	panic("trying to release non-existent task");
+}
+
+static inline void send_sig(long sig,struct task_struct * p,int priv)
+{
+	if (!p || sig<1 || sig>32)
+		return;
+	if (priv ||
+		current->uid==p->uid ||
+		current->euid==p->uid ||
+		current->uid==p->euid ||
+		current->euid==p->euid)
+		p->signal |= (1<<(sig-1));
+}
+
+void do_kill(long pid,long sig,int priv)
+{
+	struct task_struct **p = NR_TASKS + task;
+
+	if (!pid) while (--p > &FIRST_TASK) {
+		if (*p && (*p)->pgrp == current->pid)
+			send_sig(sig,*p,priv);
+	} else if (pid>0) while (--p > &FIRST_TASK) {
+		if (*p && (*p)->pid == pid)
+			send_sig(sig,*p,priv);
+	} else if (pid == -1) while (--p > &FIRST_TASK)
+		send_sig(sig,*p,priv);
+	else while (--p > &FIRST_TASK)
+		if (*p && (*p)->pgrp == -pid)
+			send_sig(sig,*p,priv);
+}
+
+int sys_kill(int pid,int sig)
+{
+	do_kill(pid,sig,!(current->uid || current->euid));
+	return 0;
+}
+
+int do_exit(long code)
+{
+	int i;
+
+	free_page_tables(get_base(current->ldt[1]),get_limit(0x0f));
+	free_page_tables(get_base(current->ldt[2]),get_limit(0x17));
+	for (i=0 ; i<NR_TASKS ; i++)
+		if (task[i] && task[i]->father == current->pid)
+			task[i]->father = 0;
+	for (i=0 ; i<NR_OPEN ; i++)
+		if (current->filp[i])
+			sys_close(i);
+	iput(current->pwd);
+	current->pwd=NULL;
+	iput(current->root);
+	current->root=NULL;
+	if (current->leader && current->tty >= 0)
+		tty_table[current->tty].pgrp = 0;
+	if (last_task_used_math == current)
+		last_task_used_math = NULL;
+	if (current->father) {
+		current->state = TASK_ZOMBIE;
+		do_kill(current->father,SIGCHLD,1);
+		current->exit_code = code;
+	} else
+		release(current);
+	schedule();
+	return (-1);	/* just to suppress warnings */
+}
+
+int sys_exit(int error_code)
+{
+	return do_exit((error_code&0xff)<<8);
+}
+
+int sys_waitpid(pid_t pid,int * stat_addr, int options)
+{
+	int flag=0;
+	struct task_struct ** p;
+
+	verify_area(stat_addr,4);
+repeat:
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+		if (*p && *p != current &&
+		   (pid==-1 || (*p)->pid==pid ||
+		   (pid==0 && (*p)->pgrp==current->pgrp) ||
+		   (pid<0 && (*p)->pgrp==-pid)))
+			if ((*p)->father == current->pid) {
+				flag=1;
+				if ((*p)->state==TASK_ZOMBIE) {
+					put_fs_long((*p)->exit_code,
+						(unsigned long *) stat_addr);
+					current->cutime += (*p)->utime;
+					current->cstime += (*p)->stime;
+					flag = (*p)->pid;
+					release(*p);
+					return flag;
+				}
+			}
+	if (flag) {
+		if (options & WNOHANG)
+			return 0;
+		sys_pause();
+		if (!(current->signal &= ~(1<<(SIGCHLD-1))))
+			goto repeat;
+		else
+			return -EINTR;
+	}
+	return -ECHILD;
+}
+
+
+/*
+ *  'fork.c' contains the help-routines for the 'fork' system call
+ * (see also system_call.s), and some misc functions ('verify_area').
+ * Fork is rather simple, once you get the hang of it, but the memory
+ * management can be a bitch. See 'mm/mm.c': 'copy_page_tables()'
+ */
+#include <errno.h>
+
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <asm/segment.h>
+#include <asm/system.h>
+
+extern void write_verify(unsigned long address);
+
+long last_pid=0;
+
+void verify_area(void * addr,int size)
+{
+	unsigned long start;
+
+	start = (unsigned long) addr;
+	size += start & 0xfff;
+	start &= 0xfffff000;
+	start += get_base(current->ldt[2]);
+	while (size>0) {
+		size -= 4096;
+		write_verify(start);
+		start += 4096;
+	}
+}
+
+int copy_mem(int nr,struct task_struct * p)
+{
+	unsigned long old_data_base,new_data_base,data_limit;
+	unsigned long old_code_base,new_code_base,code_limit;
+
+	code_limit=get_limit(0x0f);
+	data_limit=get_limit(0x17);
+	old_code_base = get_base(current->ldt[1]);
+	old_data_base = get_base(current->ldt[2]);
+	if (old_data_base != old_code_base)
+		panic("We don't support separate I&D");
+	if (data_limit < code_limit)
+		panic("Bad data_limit");
+	new_data_base = new_code_base = nr * 0x4000000;
+	set_base(p->ldt[1],new_code_base);
+	set_base(p->ldt[2],new_data_base);
+	if (copy_page_tables(old_data_base,new_data_base,data_limit)) {
+		free_page_tables(new_data_base,data_limit);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+/*
+ *  Ok, this is the main fork-routine. It copies the system process
+ * information (task[nr]) and sets up the necessary registers. It
+ * also copies the data segment in it's entirety.
+ */
+int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
+		long ebx,long ecx,long edx,
+		long fs,long es,long ds,
+		long eip,long cs,long eflags,long esp,long ss)
+{
+	struct task_struct *p;
+	int i;
+	struct file *f;
+
+	p = (struct task_struct *) get_free_page();
+	if (!p)
+		return -EAGAIN;
+	*p = *current;	/* NOTE! this doesn't copy the supervisor stack */
+	p->state = TASK_RUNNING;
+	p->pid = last_pid;
+	p->father = current->pid;
+	p->counter = p->priority;
+	p->signal = 0;
+	p->alarm = 0;
+	p->leader = 0;		/* process leadership doesn't inherit */
+	p->utime = p->stime = 0;
+	p->cutime = p->cstime = 0;
+	p->start_time = jiffies;
+	p->tss.back_link = 0;
+	p->tss.esp0 = PAGE_SIZE + (long) p;
+	p->tss.ss0 = 0x10;
+	p->tss.eip = eip;
+	p->tss.eflags = eflags;
+	p->tss.eax = 0;
+	p->tss.ecx = ecx;
+	p->tss.edx = edx;
+	p->tss.ebx = ebx;
+	p->tss.esp = esp;
+	p->tss.ebp = ebp;
+	p->tss.esi = esi;
+	p->tss.edi = edi;
+	p->tss.es = es & 0xffff;
+	p->tss.cs = cs & 0xffff;
+	p->tss.ss = ss & 0xffff;
+	p->tss.ds = ds & 0xffff;
+	p->tss.fs = fs & 0xffff;
+	p->tss.gs = gs & 0xffff;
+	p->tss.ldt = _LDT(nr);
+	p->tss.trace_bitmap = 0x80000000;
+	if (last_task_used_math == current)
+		__asm__("fnsave %0"::"m" (p->tss.i387));
+	if (copy_mem(nr,p)) {
+		free_page((long) p);
+		return -EAGAIN;
+	}
+	for (i=0; i<NR_OPEN;i++)
+		if (f=p->filp[i])
+			f->f_count++;
+	if (current->pwd)
+		current->pwd->i_count++;
+	if (current->root)
+		current->root->i_count++;
+	set_tss_desc(gdt+(nr<<1)+FIRST_TSS_ENTRY,&(p->tss));
+	set_ldt_desc(gdt+(nr<<1)+FIRST_LDT_ENTRY,&(p->ldt));
+	task[nr] = p;	/* do this last, just in case */
+	return last_pid;
+}
+
+int find_empty_process(void)
+{
+	int i;
+
+	repeat:
+		if ((++last_pid)<0) last_pid=1;
+		for(i=0 ; i<NR_TASKS ; i++)
+			if (task[i] && task[i]->pid == last_pid) goto repeat;
+	for(i=1 ; i<NR_TASKS ; i++)
+		if (!task[i])
+			return i;
+	return -EAGAIN;
+}
+#include <linux/config.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+#include <linux/hdreg.h>
+#include <asm/system.h>
+#include <asm/io.h>
+#include <asm/segment.h>
+
+/*
+ * This code handles all hd-interrupts, and read/write requests to
+ * the hard-disk. It is relatively straigthforward (not obvious maybe,
+ * but interrupts never are), while still being efficient, and never
+ * disabling interrupts (except to overcome possible race-condition).
+ * The elevator block-seek algorithm doesn't need to disable interrupts
+ * due to clever programming.
+ */
+
+/* Max read/write errors/sector */
+#define MAX_ERRORS	5
+#define MAX_HD		2
+#define NR_REQUEST	32
+
+/*
+ *  This struct defines the HD's and their types.
+ *  Currently defined for CP3044's, ie a modified
+ *  type 17.
+ */
+static struct hd_i_struct{
+	int head,sect,cyl,wpcom,lzone,ctl;
+	} hd_info[]= { HD_TYPE };
+
+#define NR_HD ((sizeof (hd_info))/(sizeof (struct hd_i_struct)))
+
+static struct hd_struct {
+	long start_sect;
+	long nr_sects;
+} hd[5*MAX_HD]={{0,0},};
+
+static struct hd_request {
+	int hd;		/* -1 if no request */
+	int nsector;
+	int sector;
+	int head;
+	int cyl;
+	int cmd;
+	int errors;
+	struct buffer_head * bh;
+	struct hd_request * next;
+} request[NR_REQUEST];
+
+#define IN_ORDER(s1,s2) \
+((s1)->hd<(s2)->hd || (s1)->hd==(s2)->hd && \
+((s1)->cyl<(s2)->cyl || (s1)->cyl==(s2)->cyl && \
+((s1)->head<(s2)->head || (s1)->head==(s2)->head && \
+((s1)->sector<(s2)->sector))))
+
+static struct hd_request * this_request = NULL;
+
+static int sorting=0;
+
+static void do_request(void);
+static void reset_controller(void);
+static void rw_abs_hd(int rw,unsigned int nr,unsigned int sec,unsigned int head,
+	unsigned int cyl,struct buffer_head * bh);
+void hd_init(void);
+
+#define port_read(port,buf,nr) \
+__asm__("cld;rep;insw"::"d" (port),"D" (buf),"c" (nr):"cx","di")
+
+#define port_write(port,buf,nr) \
+__asm__("cld;rep;outsw"::"d" (port),"S" (buf),"c" (nr):"cx","si")
+
+extern void hd_interrupt(void);
+
+static struct task_struct * wait_for_request=NULL;
+
+static inline void lock_buffer(struct buffer_head * bh)
+{
+	if (bh->b_lock)
+		printk("hd.c: buffer multiply locked\n");
+	bh->b_lock=1;
+}
+
+static inline void unlock_buffer(struct buffer_head * bh)
+{
+	if (!bh->b_lock)
+		printk("hd.c: free buffer being unlocked\n");
+	bh->b_lock=0;
+	wake_up(&bh->b_wait);
+}
+
+static inline void wait_on_buffer(struct buffer_head * bh)
+{
+	cli();
+	while (bh->b_lock)
+		sleep_on(&bh->b_wait);
+	sti();
+}
+
+void rw_hd(int rw, struct buffer_head * bh)
+{
+	unsigned int block,dev;
+	unsigned int sec,head,cyl;
+
+	block = bh->b_blocknr << 1;
+	dev = MINOR(bh->b_dev);
+	if (dev >= 5*NR_HD || block+2 > hd[dev].nr_sects)
+		return;
+	block += hd[dev].start_sect;
+	dev /= 5;
+	__asm__("divl %4":"=a" (block),"=d" (sec):"0" (block),"1" (0),
+		"r" (hd_info[dev].sect));
+	__asm__("divl %4":"=a" (cyl),"=d" (head):"0" (block),"1" (0),
+		"r" (hd_info[dev].head));
+	rw_abs_hd(rw,dev,sec+1,head,cyl,bh);
+}
+
+/* This may be used only once, enforced by 'static int callable' */
+int sys_setup(void)
+{
+	static int callable = 1;
+	int i,drive;
+	struct partition *p;
+
+	if (!callable)
+		return -1;
+	callable = 0;
+	for (drive=0 ; drive<NR_HD ; drive++) {
+		rw_abs_hd(READ,drive,1,0,0,(struct buffer_head *) start_buffer);
+		if (!start_buffer->b_uptodate) {
+			printk("Unable to read partition table of drive %d\n\r",
+				drive);
+			panic("");
+		}
+		if (start_buffer->b_data[510] != 0x55 || (unsigned char)
+		    start_buffer->b_data[511] != 0xAA) {
+			printk("Bad partition table on drive %d\n\r",drive);
+			panic("");
+		}
+		p = 0x1BE + (void *)start_buffer->b_data;
+		for (i=1;i<5;i++,p++) {
+			hd[i+5*drive].start_sect = p->start_sect;
+			hd[i+5*drive].nr_sects = p->nr_sects;
+		}
+	}
+	printk("Partition table%s ok.\n\r",(NR_HD>1)?"s":"");
+	mount_root();
+	return (0);
+}
+
+/*
+ * This is the pointer to a routine to be executed at every hd-interrupt.
+ * Interesting way of doing things, but should be rather practical.
+ */
+void (*do_hd)(void) = NULL;
+
+static int controller_ready(void)
+{
+	int retries=1000;
+
+	while (--retries && (inb(HD_STATUS)&0xc0)!=0x40);
+	return (retries);
+}
+
+static int win_result(void)
+{
+	int i=inb(HD_STATUS);
+
+	if ((i & (BUSY_STAT | READY_STAT | WRERR_STAT | SEEK_STAT | ERR_STAT))
+		== (READY_STAT | SEEK_STAT))
+		return(0); /* ok */
+	if (i&1) i=inb(HD_ERROR);
+	return (1);
+}
+
+static void hd_out(unsigned int drive,unsigned int nsect,unsigned int sect,
+		unsigned int head,unsigned int cyl,unsigned int cmd,
+		void (*intr_addr)(void))
+{
+	register int port asm("dx");
+
+	if (drive>1 || head>15)
+		panic("Trying to write bad sector");
+	if (!controller_ready())
+		panic("HD controller not ready");
+	do_hd = intr_addr;
+	outb(_CTL,HD_CMD);
+	port=HD_DATA;
+	outb_p(_WPCOM,++port);
+	outb_p(nsect,++port);
+	outb_p(sect,++port);
+	outb_p(cyl,++port);
+	outb_p(cyl>>8,++port);
+	outb_p(0xA0|(drive<<4)|head,++port);
+	outb(cmd,++port);
+}
+
+static int drive_busy(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 100000; i++)
+		if (READY_STAT == (inb(HD_STATUS) & (BUSY_STAT | READY_STAT)))
+			break;
+	i = inb(HD_STATUS);
+	i &= BUSY_STAT | READY_STAT | SEEK_STAT;
+	if (i == READY_STAT | SEEK_STAT)
+		return(0);
+	printk("HD controller times out\n\r");
+	return(1);
+}
+
+static void reset_controller(void)
+{
+	int	i;
+
+	outb(4,HD_CMD);
+	for(i = 0; i < 1000; i++) nop();
+	outb(0,HD_CMD);
+	for(i = 0; i < 10000 && drive_busy(); i++) /* nothing */;
+	if (drive_busy())
+		printk("HD-controller still busy\n\r");
+	if((i = inb(ERR_STAT)) != 1)
+		printk("HD-controller reset failed: %02x\n\r",i);
+}
+
+static void reset_hd(int nr)
+{
+	reset_controller();
+	hd_out(nr,_SECT,_SECT,_HEAD-1,_CYL,WIN_SPECIFY,&do_request);
+}
+
+void unexpected_hd_interrupt(void)
+{
+	panic("Unexpected HD interrupt\n\r");
+}
+
+static void bad_rw_intr(void)
+{
+	int i = this_request->hd;
+
+	if (this_request->errors++ >= MAX_ERRORS) {
+		this_request->bh->b_uptodate = 0;
+		unlock_buffer(this_request->bh);
+		wake_up(&wait_for_request);
+		this_request->hd = -1;
+		this_request=this_request->next;
+	}
+	reset_hd(i);
+}
+
+static void read_intr(void)
+{
+	if (win_result()) {
+		bad_rw_intr();
+		return;
+	}
+	port_read(HD_DATA,this_request->bh->b_data+
+		512*(this_request->nsector&1),256);
+	this_request->errors = 0;
+	if (--this_request->nsector)
+		return;
+	this_request->bh->b_uptodate = 1;
+	this_request->bh->b_dirt = 0;
+	wake_up(&wait_for_request);
+	unlock_buffer(this_request->bh);
+	this_request->hd = -1;
+	this_request=this_request->next;
+	do_request();
+}
+
+static void write_intr(void)
+{
+	if (win_result()) {
+		bad_rw_intr();
+		return;
+	}
+	if (--this_request->nsector) {
+		port_write(HD_DATA,this_request->bh->b_data+512,256);
+		return;
+	}
+	this_request->bh->b_uptodate = 1;
+	this_request->bh->b_dirt = 0;
+	wake_up(&wait_for_request);
+	unlock_buffer(this_request->bh);
+	this_request->hd = -1;
+	this_request=this_request->next;
+	do_request();
+}
+
+static void do_request(void)
+{
+	int i,r;
+
+	if (sorting)
+		return;
+	if (!this_request) {
+		do_hd=NULL;
+		return;
+	}
+	if (this_request->cmd == WIN_WRITE) {
+		hd_out(this_request->hd,this_request->nsector,this_request->
+			sector,this_request->head,this_request->cyl,
+			this_request->cmd,&write_intr);
+		for(i=0 ; i<3000 && !(r=inb_p(HD_STATUS)&DRQ_STAT) ; i++)
+			/* nothing */ ;
+		if (!r) {
+			reset_hd(this_request->hd);
+			return;
+		}
+		port_write(HD_DATA,this_request->bh->b_data+
+			512*(this_request->nsector&1),256);
+	} else if (this_request->cmd == WIN_READ) {
+		hd_out(this_request->hd,this_request->nsector,this_request->
+			sector,this_request->head,this_request->cyl,
+			this_request->cmd,&read_intr);
+	} else
+		panic("unknown hd-command");
+}
+
+/*
+ * add-request adds a request to the linked list.
+ * It sets the 'sorting'-variable when doing something
+ * that interrupts shouldn't touch.
+ */
+static void add_request(struct hd_request * req)
+{
+	struct hd_request * tmp;
+
+	if (req->nsector != 2)
+		panic("nsector!=2 not implemented");
+/*
+ * Not to mess up the linked lists, we never touch the two first
+ * entries (not this_request, as it is used by current interrups,
+ * and not this_request->next, as it can be assigned to this_request).
+ * This is not too high a price to pay for the ability of not
+ * disabling interrupts.
+ */
+	sorting=1;
+	if (!(tmp=this_request))
+		this_request=req;
+	else {
+		if (!(tmp->next))
+			tmp->next=req;
+		else {
+			tmp=tmp->next;
+			for ( ; tmp->next ; tmp=tmp->next)
+				if ((IN_ORDER(tmp,req) ||
+				    !IN_ORDER(tmp,tmp->next)) &&
+				    IN_ORDER(req,tmp->next))
+					break;
+			req->next=tmp->next;
+			tmp->next=req;
+		}
+	}
+	sorting=0;
+/*
+ * NOTE! As a result of sorting, the interrupts may have died down,
+ * as they aren't redone due to locking with sorting=1. They might
+ * also never have started, if this is the first request in the queue,
+ * so we restart them if necessary.
+ */
+	if (!do_hd)
+		do_request();
+}
+
+void rw_abs_hd(int rw,unsigned int nr,unsigned int sec,unsigned int head,
+	unsigned int cyl,struct buffer_head * bh)
+{
+	struct hd_request * req;
+
+	if (rw!=READ && rw!=WRITE)
+		panic("Bad hd command, must be R/W");
+	lock_buffer(bh);
+repeat:
+	for (req=0+request ; req<NR_REQUEST+request ; req++)
+		if (req->hd<0)
+			break;
+	if (req==NR_REQUEST+request) {
+		sleep_on(&wait_for_request);
+		goto repeat;
+	}
+	req->hd=nr;
+	req->nsector=2;
+	req->sector=sec;
+	req->head=head;
+	req->cyl=cyl;
+	req->cmd = ((rw==READ)?WIN_READ:WIN_WRITE);
+	req->bh=bh;
+	req->errors=0;
+	req->next=NULL;
+	add_request(req);
+	wait_on_buffer(bh);
+}
+
+void hd_init(void)
+{
+	int i;
+
+	for (i=0 ; i<NR_REQUEST ; i++) {
+		request[i].hd = -1;
+		request[i].next = NULL;
+	}
+	for (i=0 ; i<NR_HD ; i++) {
+		hd[i*5].start_sect = 0;
+		hd[i*5].nr_sects = hd_info[i].head*
+				hd_info[i].sect*hd_info[i].cyl;
+	}
+	set_trap_gate(0x2E,&hd_interrupt);
+	outb_p(inb_p(0x21)&0xfb,0x21);
+	outb(inb_p(0xA1)&0xbf,0xA1);
+}
+#include <time.h>
+
+/*
+ * This isn't the library routine, it is only used in the kernel.
+ * as such, we don't care about years<1970 etc, but assume everything
+ * is ok. Similarly, TZ etc is happily ignored. We just do everything
+ * as easily as possible. Let's find something public for the library
+ * routines (although I think minix times is public).
+ */
+/*
+ * PS. I hate whoever though up the year 1970 - couldn't they have gotten
+ * a leap-year instead? I also hate Gregorius, pope or no. I'm grumpy.
+ */
+#define MINUTE 60
+#define HOUR (60*MINUTE)
+#define DAY (24*HOUR)
+#define YEAR (365*DAY)
+
+/* interestingly, we assume leap-years */
+static int month[12] = {
+	0,
+	DAY*(31),
+	DAY*(31+29),
+	DAY*(31+29+31),
+	DAY*(31+29+31+30),
+	DAY*(31+29+31+30+31),
+	DAY*(31+29+31+30+31+30),
+	DAY*(31+29+31+30+31+30+31),
+	DAY*(31+29+31+30+31+30+31+31),
+	DAY*(31+29+31+30+31+30+31+31+30),
+	DAY*(31+29+31+30+31+30+31+31+30+31),
+	DAY*(31+29+31+30+31+30+31+31+30+31+30)
+};
+
+long kernel_mktime(struct tm * tm)
+{
+	long res;
+	int year;
+
+	year = tm->tm_year - 70;
+/* magic offsets (y+1) needed to get leapyears right.*/
+	res = YEAR*year + DAY*((year+1)/4);
+	res += month[tm->tm_mon];
+/* and (y+2) here. If it wasn't a leap-year, we have to adjust */
+	if (tm->tm_mon>1 && ((year+2)%4))
+		res -= DAY;
+	res += DAY*(tm->tm_mday-1);
+	res += HOUR*tm->tm_hour;
+	res += MINUTE*tm->tm_min;
+	res += tm->tm_sec;
+	return res;
+}
+/*
+ * This function is used through-out the kernel (includeinh mm and fs)
+ * to indicate a major problem.
+ */
+#include <linux/kernel.h>
+
+volatile void panic(const char * s)
+{
+	printk("Kernel panic: %s\n\r",s);
+	for(;;);
+}
+/*
+ * When in kernel-mode, we cannot use printf, as fs is liable to
+ * point to 'interesting' things. Make a printf with fs-saving, and
+ * all is well.
+ */
+#include <stdarg.h>
+#include <stddef.h>
+
+#include <linux/kernel.h>
+
+static char buf[1024];
+
+int printk(const char *fmt, ...)
+{
+	va_list args;
+	int i;
+
+	va_start(args, fmt);
+	i=vsprintf(buf,fmt,args);
+	va_end(args);
+	__asm__("push %%fs\n\t"
+		"push %%ds\n\t"
+		"pop %%fs\n\t"
+		"pushl %0\n\t"
+		"pushl $_buf\n\t"
+		"pushl $0\n\t"
+		"call _tty_write\n\t"
+		"addl $8,%%esp\n\t"
+		"popl %0\n\t"
+		"pop %%fs"
+		::"r" (i):"ax","cx","dx");
+	return i;
+}
+/*
+ * 'sched.c' is the main kernel file. It contains scheduling primitives
+ * (sleep_on, wakeup, schedule etc) as well as a number of simple system
+ * call functions (type getpid(), which just extracts a field from
+ * current-task
+ */
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <signal.h>
+#include <linux/sys.h>
+#include <asm/system.h>
+#include <asm/io.h>
+#include <asm/segment.h>
+
+#define LATCH (1193180/HZ)
+
+extern void mem_use(void);
+
+extern int timer_interrupt(void);
+extern int system_call(void);
+
+union task_union {
+	struct task_struct task;
+	char stack[PAGE_SIZE];
+};
+
+static union task_union init_task = {INIT_TASK,};
+
+long volatile jiffies=0;
+long startup_time=0;
+struct task_struct *current = &(init_task.task), *last_task_used_math = NULL;
+
+struct task_struct * task[NR_TASKS] = {&(init_task.task), };
+
+long user_stack [ PAGE_SIZE>>2 ] ;
+
+struct {
+	long * a;
+	short b;
+	} stack_start = { & user_stack [PAGE_SIZE>>2] , 0x10 };
+/*
+ *  'math_state_restore()' saves the current math information in the
+ * old math state array, and gets the new ones from the current task
+ */
+void math_state_restore()
+{
+	if (last_task_used_math)
+		__asm__("fnsave %0"::"m" (last_task_used_math->tss.i387));
+	if (current->used_math)
+		__asm__("frstor %0"::"m" (current->tss.i387));
+	else {
+		__asm__("fninit"::);
+		current->used_math=1;
+	}
+	last_task_used_math=current;
+}
+
+/*
+ *  'schedule()' is the scheduler function. This is GOOD CODE! There
+ * probably won't be any reason to change this, as it should work well
+ * in all circumstances (ie gives IO-bound processes good response etc).
+ * The one thing you might take a look at is the signal-handler code here.
+ *
+ *   NOTE!!  Task 0 is the 'idle' task, which gets called when no other
+ * tasks can run. It can not be killed, and it cannot sleep. The 'state'
+ * information in task[0] is never used.
+ */
+void schedule(void)
+{
+	int i,next,c;
+	struct task_struct ** p;
+
+/* check alarm, wake up any interruptible tasks that have got a signal */
+
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+		if (*p) {
+			if ((*p)->alarm && (*p)->alarm < jiffies) {
+					(*p)->signal |= (1<<(SIGALRM-1));
+					(*p)->alarm = 0;
+				}
+			if ((*p)->signal && (*p)->state==TASK_INTERRUPTIBLE)
+				(*p)->state=TASK_RUNNING;
+		}
+
+/* this is the scheduler proper: */
+
+	while (1) {
+		c = -1;
+		next = 0;
+		i = NR_TASKS;
+		p = &task[NR_TASKS];
+		while (--i) {
+			if (!*--p)
+				continue;
+			if ((*p)->state == TASK_RUNNING && (*p)->counter > c)
+				c = (*p)->counter, next = i;
+		}
+		if (c) break;
+		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+			if (*p)
+				(*p)->counter = ((*p)->counter >> 1) +
+						(*p)->priority;
+	}
+	switch_to(next);
+}
+
+int sys_pause(void)
+{
+	current->state = TASK_INTERRUPTIBLE;
+	schedule();
+	return 0;
+}
+
+void sleep_on(struct task_struct **p)
+{
+	struct task_struct *tmp;
+
+	if (!p)
+		return;
+	if (current == &(init_task.task))
+		panic("task[0] trying to sleep");
+	tmp = *p;
+	*p = current;
+	current->state = TASK_UNINTERRUPTIBLE;
+	schedule();
+	if (tmp)
+		tmp->state=0;
+}
+
+void interruptible_sleep_on(struct task_struct **p)
+{
+	struct task_struct *tmp;
+
+	if (!p)
+		return;
+	if (current == &(init_task.task))
+		panic("task[0] trying to sleep");
+	tmp=*p;
+	*p=current;
+repeat:	current->state = TASK_INTERRUPTIBLE;
+	schedule();
+	if (*p && *p != current) {
+		(**p).state=0;
+		goto repeat;
+	}
+	*p=NULL;
+	if (tmp)
+		tmp->state=0;
+}
+
+void wake_up(struct task_struct **p)
+{
+	if (p && *p) {
+		(**p).state=0;
+		*p=NULL;
+	}
+}
+
+void do_timer(long cpl)
+{
+	if (cpl)
+		current->utime++;
+	else
+		current->stime++;
+	if ((--current->counter)>0) return;
+	current->counter=0;
+	if (!cpl) return;
+	schedule();
+}
+
+int sys_alarm(long seconds)
+{
+	current->alarm = (seconds>0)?(jiffies+HZ*seconds):0;
+	return seconds;
+}
+
+int sys_getpid(void)
+{
+	return current->pid;
+}
+
+int sys_getppid(void)
+{
+	return current->father;
+}
+
+int sys_getuid(void)
+{
+	return current->uid;
+}
+
+int sys_geteuid(void)
+{
+	return current->euid;
+}
+
+int sys_getgid(void)
+{
+	return current->gid;
+}
+
+int sys_getegid(void)
+{
+	return current->egid;
+}
+
+int sys_nice(long increment)
+{
+	if (current->priority-increment>0)
+		current->priority -= increment;
+	return 0;
+}
+
+int sys_signal(long signal,long addr,long restorer)
+{
+	long i;
+
+	switch (signal) {
+		case SIGHUP: case SIGINT: case SIGQUIT: case SIGILL:
+		case SIGTRAP: case SIGABRT: case SIGFPE: case SIGUSR1:
+		case SIGSEGV: case SIGUSR2: case SIGPIPE: case SIGALRM:
+		case SIGCHLD:
+			i=(long) current->sig_fn[signal-1];
+			current->sig_fn[signal-1] = (fn_ptr) addr;
+			current->sig_restorer = (fn_ptr) restorer;
+			return i;
+		default: return -1;
+	}
+}
+
+void sched_init(void)
+{
+	int i;
+	struct desc_struct * p;
+
+	set_tss_desc(gdt+FIRST_TSS_ENTRY,&(init_task.task.tss));
+	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&(init_task.task.ldt));
+	p = gdt+2+FIRST_TSS_ENTRY;
+	for(i=1;i<NR_TASKS;i++) {
+		task[i] = NULL;
+		p->a=p->b=0;
+		p++;
+		p->a=p->b=0;
+		p++;
+	}
+	ltr(0);
+	lldt(0);
+	outb_p(0x36,0x43);		/* binary, mode 3, LSB/MSB, ch 0 */
+	outb_p(LATCH & 0xff , 0x40);	/* LSB */
+	outb(LATCH >> 8 , 0x40);	/* MSB */
+	set_intr_gate(0x20,&timer_interrupt);
+	outb(inb_p(0x21)&~0x01,0x21);
+	set_system_gate(0x80,&system_call);
+}
+/*
+ *	serial.c
+ *
+ * This module implements the rs232 io functions
+ *	void rs_write(struct tty_struct * queue);
+ *	void rs_init(void);
+ * and all interrupts pertaining to serial IO.
+ */
+
+#include <linux/tty.h>
+#include <linux/sched.h>
+#include <asm/system.h>
+#include <asm/io.h>
+
+#define WAKEUP_CHARS (TTY_BUF_SIZE/4)
+
+extern void rs1_interrupt(void);
+extern void rs2_interrupt(void);
+
+static void init(int port)
+{
+	outb_p(0x80,port+3);	/* set DLAB of line control reg */
+	outb_p(0x30,port);	/* LS of divisor (48 -> 2400 bps */
+	outb_p(0x00,port+1);	/* MS of divisor */
+	outb_p(0x03,port+3);	/* reset DLAB */
+	outb_p(0x0b,port+4);	/* set DTR,RTS, OUT_2 */
+	outb_p(0x0d,port+1);	/* enable all intrs but writes */
+	(void)inb(port);	/* read data port to reset things (?) */
+}
+
+void rs_init(void)
+{
+	set_intr_gate(0x24,rs1_interrupt);
+	set_intr_gate(0x23,rs2_interrupt);
+	init(tty_table[1].read_q.data);
+	init(tty_table[2].read_q.data);
+	outb(inb_p(0x21)&0xE7,0x21);
+}
+
+/*
+ * This routine gets called when tty_write has put something into
+ * the write_queue. It must check wheter the queue is empty, and
+ * set the interrupt register accordingly
+ *
+ *	void _rs_write(struct tty_struct * tty);
+ */
+void rs_write(struct tty_struct * tty)
+{
+	cli();
+	if (!EMPTY(tty->write_q))
+		outb(inb_p(tty->write_q.data+1)|0x02,tty->write_q.data+1);
+	sti();
+}
+#include <errno.h>
+
+#include <linux/sched.h>
+#include <linux/tty.h>
+#include <linux/kernel.h>
+#include <asm/segment.h>
+#include <sys/times.h>
+#include <sys/utsname.h>
+
+int sys_ftime()
+{
+	return -ENOSYS;
+}
+
+int sys_mknod()
+{
+	return -ENOSYS;
+}
+
+int sys_break()
+{
+	return -ENOSYS;
+}
+
+int sys_mount()
+{
+	return -ENOSYS;
+}
+
+int sys_umount()
+{
+	return -ENOSYS;
+}
+
+int sys_ustat(int dev,struct ustat * ubuf)
+{
+	return -1;
+}
+
+int sys_ptrace()
+{
+	return -ENOSYS;
+}
+
+int sys_stty()
+{
+	return -ENOSYS;
+}
+
+int sys_gtty()
+{
+	return -ENOSYS;
+}
+
+int sys_rename()
+{
+	return -ENOSYS;
+}
+
+int sys_prof()
+{
+	return -ENOSYS;
+}
+
+int sys_setgid(int gid)
+{
+	if (current->euid && current->uid)
+		if (current->gid==gid || current->sgid==gid)
+			current->egid=gid;
+		else
+			return -EPERM;
+	else
+		current->gid=current->egid=gid;
+	return 0;
+}
+
+int sys_acct()
+{
+	return -ENOSYS;
+}
+
+int sys_phys()
+{
+	return -ENOSYS;
+}
+
+int sys_lock()
+{
+	return -ENOSYS;
+}
+
+int sys_mpx()
+{
+	return -ENOSYS;
+}
+
+int sys_ulimit()
+{
+	return -ENOSYS;
+}
+
+int sys_time(long * tloc)
+{
+	int i;
+
+	i = CURRENT_TIME;
+	if (tloc) {
+		verify_area(tloc,4);
+		put_fs_long(i,(unsigned long *)tloc);
+	}
+	return i;
+}
+
+int sys_setuid(int uid)
+{
+	if (current->euid && current->uid)
+		if (uid==current->uid || current->suid==current->uid)
+			current->euid=uid;
+		else
+			return -EPERM;
+	else
+		current->euid=current->uid=uid;
+	return 0;
+}
+
+int sys_stime(long * tptr)
+{
+	if (current->euid && current->uid)
+		return -1;
+	startup_time = get_fs_long((unsigned long *)tptr) - jiffies/HZ;
+	return 0;
+}
+
+int sys_times(struct tms * tbuf)
+{
+	if (!tbuf)
+		return jiffies;
+	verify_area(tbuf,sizeof *tbuf);
+	put_fs_long(current->utime,(unsigned long *)&tbuf->tms_utime);
+	put_fs_long(current->stime,(unsigned long *)&tbuf->tms_stime);
+	put_fs_long(current->cutime,(unsigned long *)&tbuf->tms_cutime);
+	put_fs_long(current->cstime,(unsigned long *)&tbuf->tms_cstime);
+	return jiffies;
+}
+
+int sys_brk(unsigned long end_data_seg)
+{
+	if (end_data_seg >= current->end_code &&
+	    end_data_seg < current->start_stack - 16384)
+		current->brk = end_data_seg;
+	return current->brk;
+}
+
+/*
+ * This needs some heave checking ...
+ * I just haven't get the stomach for it. I also don't fully
+ * understand sessions/pgrp etc. Let somebody who does explain it.
+ */
+int sys_setpgid(int pid, int pgid)
+{
+	int i;
+
+	if (!pid)
+		pid = current->pid;
+	if (!pgid)
+		pgid = pid;
+	for (i=0 ; i<NR_TASKS ; i++)
+		if (task[i] && task[i]->pid==pid) {
+			if (task[i]->leader)
+				return -EPERM;
+			if (task[i]->session != current->session)
+				return -EPERM;
+			task[i]->pgrp = pgid;
+			return 0;
+		}
+	return -ESRCH;
+}
+
+int sys_getpgrp(void)
+{
+	return current->pgrp;
+}
+
+int sys_setsid(void)
+{
+	if (current->uid && current->euid)
+		return -EPERM;
+	if (current->leader)
+		return -EPERM;
+	current->leader = 1;
+	current->session = current->pgrp = current->pid;
+	current->tty = -1;
+	return current->pgrp;
+}
+
+int sys_uname(struct utsname * name)
+{
+	static struct utsname thisname = {
+		"linux .0","nodename","release ","version ","machine "
+	};
+	int i;
+
+	if (!name) return -1;
+	verify_area(name,sizeof *name);
+	for(i=0;i<sizeof *name;i++)
+		put_fs_byte(((char *) &thisname)[i],i+(char *) name);
+	return (0);
+}
+
+int sys_umask(int mask)
+{
+	int old = current->umask;
+
+	current->umask = mask & 0777;
+	return (old);
+}
+/*
+ * 'Traps.c' handles hardware traps and faults after we have saved some
+ * state in 'asm.s'. Currently mostly a debugging-aid, will be extended
+ * to mainly kill the offending process (probably by giving it a signal,
+ * but possibly by killing it outright if necessary).
+ */
+#include <string.h>
+
+#include <linux/head.h>
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <asm/system.h>
+#include <asm/segment.h>
+
+#define get_seg_byte(seg,addr) ({ \
+register char __res; \
+__asm__("push %%fs;mov %%ax,%%fs;movb %%fs:%2,%%al;pop %%fs" \
+	:"=a" (__res):"0" (seg),"m" (*(addr))); \
+__res;})
+
+#define get_seg_long(seg,addr) ({ \
+register unsigned long __res; \
+__asm__("push %%fs;mov %%ax,%%fs;movl %%fs:%2,%%eax;pop %%fs" \
+	:"=a" (__res):"0" (seg),"m" (*(addr))); \
+__res;})
+
+#define _fs() ({ \
+register unsigned short __res; \
+__asm__("mov %%fs,%%ax":"=a" (__res):); \
+__res;})
+
+int do_exit(long code);
+
+void page_exception(void);
+
+void divide_error(void);
+void debug(void);
+void nmi(void);
+void int3(void);
+void overflow(void);
+void bounds(void);
+void invalid_op(void);
+void device_not_available(void);
+void double_fault(void);
+void coprocessor_segment_overrun(void);
+void invalid_TSS(void);
+void segment_not_present(void);
+void stack_segment(void);
+void general_protection(void);
+void page_fault(void);
+void coprocessor_error(void);
+void reserved(void);
+
+static void die(char * str,long esp_ptr,long nr)
+{
+	long * esp = (long *) esp_ptr;
+	int i;
+
+	printk("%s: %04x\n\r",str,nr&0xffff);
+	printk("EIP:\t%04x:%p\nEFLAGS:\t%p\nESP:\t%04x:%p\n",
+		esp[1],esp[0],esp[2],esp[4],esp[3]);
+	printk("fs: %04x\n",_fs());
+	printk("base: %p, limit: %p\n",get_base(current->ldt[1]),get_limit(0x17));
+	if (esp[4] == 0x17) {
+		printk("Stack: ");
+		for (i=0;i<4;i++)
+			printk("%p ",get_seg_long(0x17,i+(long *)esp[3]));
+		printk("\n");
+	}
+	str(i);
+	printk("Pid: %d, process nr: %d\n\r",current->pid,0xffff & i);
+	for(i=0;i<10;i++)
+		printk("%02x ",0xff & get_seg_byte(esp[1],(i+(char *)esp[0])));
+	printk("\n\r");
+	do_exit(11);		/* play segment exception */
+}
+
+void do_double_fault(long esp, long error_code)
+{
+	die("double fault",esp,error_code);
+}
+
+void do_general_protection(long esp, long error_code)
+{
+	die("general protection",esp,error_code);
+}
+
+void do_divide_error(long esp, long error_code)
+{
+	die("divide error",esp,error_code);
+}
+
+void do_int3(long * esp, long error_code,
+		long fs,long es,long ds,
+		long ebp,long esi,long edi,
+		long edx,long ecx,long ebx,long eax)
+{
+	int tr;
+
+	__asm__("str %%ax":"=a" (tr):"0" (0));
+	printk("eax\t\tebx\t\tecx\t\tedx\n\r%8x\t%8x\t%8x\t%8x\n\r",
+		eax,ebx,ecx,edx);
+	printk("esi\t\tedi\t\tebp\t\tesp\n\r%8x\t%8x\t%8x\t%8x\n\r",
+		esi,edi,ebp,(long) esp);
+	printk("\n\rds\tes\tfs\ttr\n\r%4x\t%4x\t%4x\t%4x\n\r",
+		ds,es,fs,tr);
+	printk("EIP: %8x   CS: %4x  EFLAGS: %8x\n\r",esp[0],esp[1],esp[2]);
+}
+
+void do_nmi(long esp, long error_code)
+{
+	die("nmi",esp,error_code);
+}
+
+void do_debug(long esp, long error_code)
+{
+	die("debug",esp,error_code);
+}
+
+void do_overflow(long esp, long error_code)
+{
+	die("overflow",esp,error_code);
+}
+
+void do_bounds(long esp, long error_code)
+{
+	die("bounds",esp,error_code);
+}
+
+void do_invalid_op(long esp, long error_code)
+{
+	die("invalid operand",esp,error_code);
+}
+
+void do_device_not_available(long esp, long error_code)
+{
+	die("device not available",esp,error_code);
+}
+
+void do_coprocessor_segment_overrun(long esp, long error_code)
+{
+	die("coprocessor segment overrun",esp,error_code);
+}
+
+void do_invalid_TSS(long esp,long error_code)
+{
+	die("invalid TSS",esp,error_code);
+}
+
+void do_segment_not_present(long esp,long error_code)
+{
+	die("segment not present",esp,error_code);
+}
+
+void do_stack_segment(long esp,long error_code)
+{
+	die("stack segment",esp,error_code);
+}
+
+void do_coprocessor_error(long esp, long error_code)
+{
+	die("coprocessor error",esp,error_code);
+}
+
+void do_reserved(long esp, long error_code)
+{
+	die("reserved (15,17-31) error",esp,error_code);
+}
+
+void trap_init(void)
+{
+	int i;
+
+	set_trap_gate(0,&divide_error);
+	set_trap_gate(1,&debug);
+	set_trap_gate(2,&nmi);
+	set_system_gate(3,&int3);	/* int3-5 can be called from all */
+	set_system_gate(4,&overflow);
+	set_system_gate(5,&bounds);
+	set_trap_gate(6,&invalid_op);
+	set_trap_gate(7,&device_not_available);
+	set_trap_gate(8,&double_fault);
+	set_trap_gate(9,&coprocessor_segment_overrun);
+	set_trap_gate(10,&invalid_TSS);
+	set_trap_gate(11,&segment_not_present);
+	set_trap_gate(12,&stack_segment);
+	set_trap_gate(13,&general_protection);
+	set_trap_gate(14,&page_fault);
+	set_trap_gate(15,&reserved);
+	set_trap_gate(16,&coprocessor_error);
+	for (i=17;i<32;i++)
+		set_trap_gate(i,&reserved);
+/*	__asm__("movl $0x3ff000,%%eax\n\t"
+		"movl %%eax,%%db0\n\t"
+		"movl $0x000d0303,%%eax\n\t"
+		"movl %%eax,%%db7"
+		:::"ax");*/
+}
+
+/*
+ * 'tty_io.c' gives an orthogonal feeling to tty's, be they consoles
+ * or rs-channels. It also implements echoing, cooked mode etc (well,
+ * not currently, but ...)
+ */
+#include <ctype.h>
+#include <errno.h>
+#include <signal.h>
+
+#define ALRMMASK (1<<(SIGALRM-1))
+
+#include <linux/sched.h>
+#include <linux/tty.h>
+#include <asm/segment.h>
+#include <asm/system.h>
+
+#define _L_FLAG(tty,f)	((tty)->termios.c_lflag & f)
+#define _I_FLAG(tty,f)	((tty)->termios.c_iflag & f)
+#define _O_FLAG(tty,f)	((tty)->termios.c_oflag & f)
+
+#define L_CANON(tty)	_L_FLAG((tty),ICANON)
+#define L_ISIG(tty)	_L_FLAG((tty),ISIG)
+#define L_ECHO(tty)	_L_FLAG((tty),ECHO)
+#define L_ECHOE(tty)	_L_FLAG((tty),ECHOE)
+#define L_ECHOK(tty)	_L_FLAG((tty),ECHOK)
+#define L_ECHOCTL(tty)	_L_FLAG((tty),ECHOCTL)
+#define L_ECHOKE(tty)	_L_FLAG((tty),ECHOKE)
+
+#define I_UCLC(tty)	_I_FLAG((tty),IUCLC)
+#define I_NLCR(tty)	_I_FLAG((tty),INLCR)
+#define I_CRNL(tty)	_I_FLAG((tty),ICRNL)
+#define I_NOCR(tty)	_I_FLAG((tty),IGNCR)
+
+#define O_POST(tty)	_O_FLAG((tty),OPOST)
+#define O_NLCR(tty)	_O_FLAG((tty),ONLCR)
+#define O_CRNL(tty)	_O_FLAG((tty),OCRNL)
+#define O_NLRET(tty)	_O_FLAG((tty),ONLRET)
+#define O_LCUC(tty)	_O_FLAG((tty),OLCUC)
+
+struct tty_struct tty_table[] = {
+	{
+		{0,
+		OPOST|ONLCR,	/* change outgoing NL to CRNL */
+		0,
+		ICANON | ECHO | ECHOCTL | ECHOKE,
+		0,		/* console termio */
+		INIT_C_CC},
+		0,			/* initial pgrp */
+		0,			/* initial stopped */
+		con_write,
+		{0,0,0,0,""},		/* console read-queue */
+		{0,0,0,0,""},		/* console write-queue */
+		{0,0,0,0,""}		/* console secondary queue */
+	},{
+		{0, /*IGNCR*/
+		OPOST | ONLRET,		/* change outgoing NL to CR */
+		B2400 | CS8,
+		0,
+		0,
+		INIT_C_CC},
+		0,
+		0,
+		rs_write,
+		{0x3f8,0,0,0,""},		/* rs 1 */
+		{0x3f8,0,0,0,""},
+		{0,0,0,0,""}
+	},{
+		{0, /*IGNCR*/
+		OPOST | ONLRET,		/* change outgoing NL to CR */
+		B2400 | CS8,
+		0,
+		0,
+		INIT_C_CC},
+		0,
+		0,
+		rs_write,
+		{0x2f8,0,0,0,""},		/* rs 2 */
+		{0x2f8,0,0,0,""},
+		{0,0,0,0,""}
+	}
+};
+
+/*
+ * these are the tables used by the machine code handlers.
+ * you can implement pseudo-tty's or something by changing
+ * them. Currently not done.
+ */
+struct tty_queue * table_list[]={
+	&tty_table[0].read_q, &tty_table[0].write_q,
+	&tty_table[1].read_q, &tty_table[1].write_q,
+	&tty_table[2].read_q, &tty_table[2].write_q
+	};
+
+void tty_init(void)
+{
+	rs_init();
+	con_init();
+}
+
+void tty_intr(struct tty_struct * tty, int signal)
+{
+	int i;
+
+	if (tty->pgrp <= 0)
+		return;
+	for (i=0;i<NR_TASKS;i++)
+		if (task[i] && task[i]->pgrp==tty->pgrp)
+			task[i]->signal |= 1<<(signal-1);
+}
+
+static void sleep_if_empty(struct tty_queue * queue)
+{
+	cli();
+	while (!current->signal && EMPTY(*queue))
+		interruptible_sleep_on(&queue->proc_list);
+	sti();
+}
+
+static void sleep_if_full(struct tty_queue * queue)
+{
+	if (!FULL(*queue))
+		return;
+	cli();
+	while (!current->signal && LEFT(*queue)<128)
+		interruptible_sleep_on(&queue->proc_list);
+	sti();
+}
+
+void copy_to_cooked(struct tty_struct * tty)
+{
+	signed char c;
+
+	while (!EMPTY(tty->read_q) && !FULL(tty->secondary)) {
+		GETCH(tty->read_q,c);
+		if (c==13)
+			if (I_CRNL(tty))
+				c=10;
+			else if (I_NOCR(tty))
+				continue;
+			else ;
+		else if (c==10 && I_NLCR(tty))
+			c=13;
+		if (I_UCLC(tty))
+			c=tolower(c);
+		if (L_CANON(tty)) {
+			if (c==ERASE_CHAR(tty)) {
+				if (EMPTY(tty->secondary) ||
+				   (c=LAST(tty->secondary))==10 ||
+				   c==EOF_CHAR(tty))
+					continue;
+				if (L_ECHO(tty)) {
+					if (c<32)
+						PUTCH(127,tty->write_q);
+					PUTCH(127,tty->write_q);
+					tty->write(tty);
+				}
+				DEC(tty->secondary.head);
+				continue;
+			}
+			if (c==STOP_CHAR(tty)) {
+				tty->stopped=1;
+				continue;
+			}
+			if (c==START_CHAR(tty)) {
+				tty->stopped=0;
+				continue;
+			}
+		}
+		if (!L_ISIG(tty)) {
+			if (c==INTR_CHAR(tty)) {
+				tty_intr(tty,SIGINT);
+				continue;
+			}
+		}
+		if (c==10 || c==EOF_CHAR(tty))
+			tty->secondary.data++;
+		if (L_ECHO(tty)) {
+			if (c==10) {
+				PUTCH(10,tty->write_q);
+				PUTCH(13,tty->write_q);
+			} else if (c<32) {
+				if (L_ECHOCTL(tty)) {
+					PUTCH('^',tty->write_q);
+					PUTCH(c+64,tty->write_q);
+				}
+			} else
+				PUTCH(c,tty->write_q);
+			tty->write(tty);
+		}
+		PUTCH(c,tty->secondary);
+	}
+	wake_up(&tty->secondary.proc_list);
+}
+
+int tty_read(unsigned channel, char * buf, int nr)
+{
+	struct tty_struct * tty;
+	char c, * b=buf;
+	int minimum,time,flag=0;
+	long oldalarm;
+
+	if (channel>2 || nr<0) return -1;
+	tty = &tty_table[channel];
+	oldalarm = current->alarm;
+	time = (unsigned) 10*tty->termios.c_cc[VTIME];
+	minimum = (unsigned) tty->termios.c_cc[VMIN];
+	if (time && !minimum) {
+		minimum=1;
+		if (flag=(!oldalarm || time+jiffies<oldalarm))
+			current->alarm = time+jiffies;
+	}
+	if (minimum>nr)
+		minimum=nr;
+	while (nr>0) {
+		if (flag && (current->signal & ALRMMASK)) {
+			current->signal &= ~ALRMMASK;
+			break;
+		}
+		if (current->signal)
+			break;
+		if (EMPTY(tty->secondary) || (L_CANON(tty) &&
+		!tty->secondary.data && LEFT(tty->secondary)>20)) {
+			sleep_if_empty(&tty->secondary);
+			continue;
+		}
+		do {
+			GETCH(tty->secondary,c);
+			if (c==EOF_CHAR(tty) || c==10)
+				tty->secondary.data--;
+			if (c==EOF_CHAR(tty) && L_CANON(tty))
+				return (b-buf);
+			else {
+				put_fs_byte(c,b++);
+				if (!--nr)
+					break;
+			}
+		} while (nr>0 && !EMPTY(tty->secondary));
+		if (time && !L_CANON(tty))
+			if (flag=(!oldalarm || time+jiffies<oldalarm))
+				current->alarm = time+jiffies;
+			else
+				current->alarm = oldalarm;
+		if (L_CANON(tty)) {
+			if (b-buf)
+				break;
+		} else if (b-buf >= minimum)
+			break;
+	}
+	current->alarm = oldalarm;
+	if (current->signal && !(b-buf))
+		return -EINTR;
+	return (b-buf);
+}
+
+int tty_write(unsigned channel, char * buf, int nr)
+{
+	static cr_flag=0;
+	struct tty_struct * tty;
+	char c, *b=buf;
+
+	if (channel>2 || nr<0) return -1;
+	tty = channel + tty_table;
+	while (nr>0) {
+		sleep_if_full(&tty->write_q);
+		if (current->signal)
+			break;
+		while (nr>0 && !FULL(tty->write_q)) {
+			c=get_fs_byte(b);
+			if (O_POST(tty)) {
+				if (c=='\r' && O_CRNL(tty))
+					c='\n';
+				else if (c=='\n' && O_NLRET(tty))
+					c='\r';
+				if (c=='\n' && !cr_flag && O_NLCR(tty)) {
+					cr_flag = 1;
+					PUTCH(13,tty->write_q);
+					continue;
+				}
+				if (O_LCUC(tty))
+					c=toupper(c);
+			}
+			b++; nr--;
+			cr_flag = 0;
+			PUTCH(c,tty->write_q);
+		}
+		tty->write(tty);
+		if (nr>0)
+			schedule();
+	}
+	return (b-buf);
+}
+
+/*
+ * Jeh, sometimes I really like the 386.
+ * This routine is called from an interrupt,
+ * and there should be absolutely no problem
+ * with sleeping even in an interrupt (I hope).
+ * Of course, if somebody proves me wrong, I'll
+ * hate intel for all time :-). We'll have to
+ * be careful and see to reinstating the interrupt
+ * chips before calling this, though.
+ */
+void do_tty_interrupt(int tty)
+{
+	copy_to_cooked(tty_table+tty);
+}
+/* vsprintf.c -- Lars Wirzenius & Linus Torvalds. */
+/*
+ * Wirzenius wrote this portably, Torvalds fucked it up :-)
+ */
+
+#include <stdarg.h>
+#include <string.h>
+
+/* we use this so that we can do without the ctype library */
+#define is_digit(c)	((c) >= '0' && (c) <= '9')
+
+static int skip_atoi(const char **s)
+{
+	int i=0;
+
+	while (is_digit(**s))
+		i = i*10 + *((*s)++) - '0';
+	return i;
+}
+
+#define ZEROPAD	1		/* pad with zero */
+#define SIGN	2		/* unsigned/signed long */
+#define PLUS	4		/* show plus */
+#define SPACE	8		/* space if plus */
+#define LEFT	16		/* left justified */
+#define SPECIAL	32		/* 0x */
+#define SMALL	64		/* use 'abcdef' instead of 'ABCDEF' */
+
+#define do_div(n,base) ({ \
+int __res; \
+__asm__("divl %4":"=a" (n),"=d" (__res):"0" (n),"1" (0),"r" (base)); \
+__res; })
+
+static char * number(char * str, int num, int base, int size, int precision
+	,int type)
+{
+	char c,sign,tmp[36];
+	const char *digits="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	int i;
+
+	if (type&SMALL) digits="0123456789abcdefghijklmnopqrstuvwxyz";
+	if (type&LEFT) type &= ~ZEROPAD;
+	if (base<2 || base>36)
+		return 0;
+	c = (type & ZEROPAD) ? '0' : ' ' ;
+	if (type&SIGN && num<0) {
+		sign='-';
+		num = -num;
+	} else
+		sign=(type&PLUS) ? '+' : ((type&SPACE) ? ' ' : 0);
+	if (sign) size--;
+	if (type&SPECIAL)
+		if (base==16) size -= 2;
+		else if (base==8) size--;
+	i=0;
+	if (num==0)
+		tmp[i++]='0';
+	else while (num!=0)
+		tmp[i++]=digits[do_div(num,base)];
+	if (i>precision) precision=i;
+	size -= precision;
+	if (!(type&(ZEROPAD+LEFT)))
+		while(size-->0)
+			*str++ = ' ';
+	if (sign)
+		*str++ = sign;
+	if (type&SPECIAL)
+		if (base==8)
+			*str++ = '0';
+		else if (base==16) {
+			*str++ = '0';
+			*str++ = digits[33];
+		}
+	if (!(type&LEFT))
+		while(size-->0)
+			*str++ = c;
+	while(i<precision--)
+		*str++ = '0';
+	while(i-->0)
+		*str++ = tmp[i];
+	while(size-->0)
+		*str++ = ' ';
+	return str;
+}
+
+int vsprintf(char *buf, const char *fmt, va_list args)
+{
+	int len;
+	int i;
+	char * str;
+	char *s;
+	int *ip;
+
+	int flags;		/* flags to number() */
+
+	int field_width;	/* width of output field */
+	int precision;		/* min. # of digits for integers; max
+				   number of chars for from string */
+	int qualifier;		/* 'h', 'l', or 'L' for integer fields */
+
+	for (str=buf ; *fmt ; ++fmt) {
+		if (*fmt != '%') {
+			*str++ = *fmt;
+			continue;
+		}
+			
+		/* process flags */
+		flags = 0;
+		repeat:
+			++fmt;		/* this also skips first '%' */
+			switch (*fmt) {
+				case '-': flags |= LEFT; goto repeat;
+				case '+': flags |= PLUS; goto repeat;
+				case ' ': flags |= SPACE; goto repeat;
+				case '#': flags |= SPECIAL; goto repeat;
+				case '0': flags |= ZEROPAD; goto repeat;
+				}
+		
+		/* get field width */
+		field_width = -1;
+		if (is_digit(*fmt))
+			field_width = skip_atoi(&fmt);
+		else if (*fmt == '*') {
+			/* it's the next argument */
+			field_width = va_arg(args, int);
+			if (field_width < 0) {
+				field_width = -field_width;
+				flags |= LEFT;
+			}
+		}
+
+		/* get the precision */
+		precision = -1;
+		if (*fmt == '.') {
+			++fmt;	
+			if (is_digit(*fmt))
+				precision = skip_atoi(&fmt);
+			else if (*fmt == '*') {
+				/* it's the next argument */
+				precision = va_arg(args, int);
+			}
+			if (precision < 0)
+				precision = 0;
+		}
+
+		/* get the conversion qualifier */
+		qualifier = -1;
+		if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L') {
+			qualifier = *fmt;
+			++fmt;
+		}
+
+		switch (*fmt) {
+		case 'c':
+			if (!(flags & LEFT))
+				while (--field_width > 0)
+					*str++ = ' ';
+			*str++ = (unsigned char) va_arg(args, int);
+			while (--field_width > 0)
+				*str++ = ' ';
+			break;
+
+		case 's':
+			s = va_arg(args, char *);
+			len = strlen(s);
+			if (precision < 0)
+				precision = len;
+			else if (len > precision)
+				len = precision;
+
+			if (!(flags & LEFT))
+				while (len < field_width--)
+					*str++ = ' ';
+			for (i = 0; i < len; ++i)
+				*str++ = *s++;
+			while (len < field_width--)
+				*str++ = ' ';
+			break;
+
+		case 'o':
+			str = number(str, va_arg(args, unsigned long), 8,
+				field_width, precision, flags);
+			break;
+
+		case 'p':
+			if (field_width == -1) {
+				field_width = 8;
+				flags |= ZEROPAD;
+			}
+			str = number(str,
+				(unsigned long) va_arg(args, void *), 16,
+				field_width, precision, flags);
+			break;
+
+		case 'x':
+			flags |= SMALL;
+		case 'X':
+			str = number(str, va_arg(args, unsigned long), 16,
+				field_width, precision, flags);
+			break;
+
+		case 'd':
+		case 'i':
+			flags |= SIGN;
+		case 'u':
+			str = number(str, va_arg(args, unsigned long), 10,
+				field_width, precision, flags);
+			break;
+
+		case 'n':
+			ip = va_arg(args, int *);
+			*ip = (str - buf);
+			break;
+
+		default:
+			if (*fmt != '%')
+				*str++ = '%';
+			if (*fmt)
+				*str++ = *fmt;
+			else
+				--fmt;
+			break;
+		}
+	}
+	*str = '\0';
+	return str-buf;
+}
