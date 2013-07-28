@@ -27,11 +27,11 @@ import           Test.Framework.TestManager
 -- | Example QuickCheck test
 prop_config :: FilePath -> FilePath -> FilePath -> Bool
 prop_config base new out =  config == config
-    where config = DU.Diff { DU.baseFile = base, DU.newFile = new, DU.dOutFile = Just out}
+    where config = DU.Diff { DU._baseFile = base, DU._newFile = new, DU._dOutFile = Just out}
 
 -- | Test fixture
 defaultConfig :: DU.DConfig
-defaultConfig = DU.Diff { DU.baseFile = "original.txt", DU.newFile = "original-1.txt", DU.dOutFile = Nothing}
+defaultConfig = DU.Diff { DU._baseFile = "original.txt", DU._newFile = "original-1.txt", DU._dOutFile = Nothing}
 
 -- | Example assertion test
 test_oddSquareSum :: Assertion

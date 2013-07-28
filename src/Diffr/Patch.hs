@@ -33,7 +33,7 @@ data Instruction = Copy Integer Integer | Insert B.ByteString deriving (Show)
 
 parseDumpFile :: B.ByteString -> [Instruction]
 parseDumpFile contents =
-  case parse (choice [parseCopy, parseInsert]) contents of
+  case AC.feed (AC.parse (choice [parseCopy, parseInsert]) contents) B.empty of
     --Fail _ _ y -> error y
     Done contents' bla -> bla : parseDumpFile contents'
     Fail {} -> []
@@ -41,17 +41,17 @@ parseDumpFile contents =
     
 
 parseCopy :: AC.Parser Instruction
-parseCopy = (Copy) <$> (AC.decimal AC.<*. ",")
-                   <*> (AC.decimal <* newline)
+parseCopy = Copy <$> (AC.decimal AC.<*. ",")
+                 <*> (AC.decimal <* newline)
 
 parseInsert :: AC.Parser Instruction
-parseInsert = (Insert) <$> (gt *> text)
+parseInsert = Insert <$> (gt *> text)
    where gt = AC.string ">"
          text = takeWhile notEOL <* newline
          notEOL w = not (w == 13 || w == 10)
 
-newline :: AC.Parser Word8
-newline = choice [word8 10, word8 13]
+newline :: AC.Parser ()
+newline =  return () <$> choice [word8 10, word8 13]
 
 main :: IO ()
 main = do
