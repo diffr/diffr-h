@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns       #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings  #-}
 {- |
@@ -24,37 +25,31 @@ module Diffr.Patch where
 import           Control.Applicative              hiding (many)
 import           Data.Attoparsec.ByteString
 import qualified Data.Attoparsec.ByteString.Char8 as AC
-import           Data.Attoparsec.Combinator
 import qualified Data.ByteString                  as B
-import           Data.Word                        (Word8)
-import Prelude hiding (takeWhile)
+import           Prelude                          hiding (takeWhile)
 
-data Instruction = Copy Integer Integer | Insert B.ByteString deriving (Show)
+data Instruction
+     = Copy Integer Integer
+     | Insert B.ByteString
+     deriving (Show)
 
-parseDumpFile :: B.ByteString -> [Instruction]
-parseDumpFile contents =
-  case AC.feed (AC.parse (choice [parseCopy, parseInsert]) contents) B.empty of
-    --Fail _ _ y -> error y
-    Done contents' bla -> bla : parseDumpFile contents'
-    Fail {} -> []
-    Partial {} -> []
-    
+parsePatch :: B.ByteString -> Maybe [Instruction]
+parsePatch bs =
+    case AC.feed (AC.parse (AC.many1 line) bs) B.empty of
+        Fail {} -> Nothing
+        Partial {} -> Nothing
+        Done remaining r -> if remaining == B.empty then Just r else Nothing
+
+line :: AC.Parser Instruction
+line = (parseCopy <|> parseInsert) <* end
 
 parseCopy :: AC.Parser Instruction
-parseCopy = Copy <$> (AC.decimal AC.<*. ",")
-                 <*> (AC.decimal <* newline)
+parseCopy = Copy <$> AC.decimal <* "," <*> AC.decimal
 
 parseInsert :: AC.Parser Instruction
 parseInsert = Insert <$> (gt *> text)
-   where gt = AC.string ">"
-         text = takeWhile notEOL <* newline
-         notEOL w = not (w == 13 || w == 10)
+   where gt = "> "
+         text = takeTill (\w -> w == 13 || w == 10)
 
-newline :: AC.Parser ()
-newline =  return () <$> choice [word8 10, word8 13]
-
-main :: IO ()
-main = do
-  file <- B.readFile "/Users/jakubkozlowski/Programming/Eclipse/diffr-h/cp.patch"
-  print (parseDumpFile file)
-
+end :: AC.Parser ()
+end =  AC.endOfLine <|> AC.endOfInput

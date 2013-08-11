@@ -31,10 +31,11 @@ import           Data.Array.MArray
 import qualified Data.ByteString        as B
 import qualified Data.ByteString.Char8  as BChar
 import qualified Data.List              as List
+import qualified Diffr.Patch            as Patch
 import qualified Diffr.Util             as DU
 import qualified System.Console.CmdArgs as CM
 import           System.Environment     (getArgs, withArgs)
-import qualified Diffr.Patch as Patch
+import System.Exit (exitFailure)
 
 main :: IO ()
 main = do
@@ -43,17 +44,23 @@ main = do
     opts <- (if null args then withArgs ["--help"] else id) $ CM.cmdArgsRun DU.diffrModes
     case opts of
         DU.Diff {..} -> putStrLn "Hello World"
-        (DU.Patch {_originalFile, _patchFile, _pOutFile}) -> patch _originalFile _patchFile _pOutFile
+        DU.Patch {_originalFile, _patchFile, _pOutFile} -> patch _originalFile _patchFile _pOutFile
 
 patch :: FilePath -> FilePath -> Maybe FilePath -> IO ()
-patch path _ _ = do 
-    file <- B.readFile path
-    print (Patch.parseDumpFile file)
---patch _ _ _ = do
---   file <- liftM (List.zip [1..] . BChar.lines) $ BChar.readFile "/Users/jakubkozlowski/Programming/Eclipse/diffr-h/kernel33.txt"
---   len <- return (length file)
---   arr <- newArray_ (1,len) :: IO (IOArray Int BChar.ByteString)
---   forM_ file $ (\(i, line) -> do
---        writeArray arr i line)
---   b <- readArray arr 1000
---   print b
+patch path originalFile _ = do
+    patchFile <- B.readFile path
+    bla <- return (Patch.parsePatch patchFile)
+    case bla of 
+        Nothing -> do
+            putStrLn "Unparseable patch"
+            exitFailure
+        Just instructions -> do 
+            file <- BChar.readFile originalFile
+            let indexes = List.zip [1..] . BChar.lines $ file 
+                len = length indexes
+            arr <- newArray_ (1,len) :: IO (IOArray Int BChar.ByteString)
+            forM_ indexes $ (\(i, line) -> do
+                writeArray arr i line)
+            forM_ instructions $ (\i -> case i of
+                Patch.Copy left right -> return ()
+                Patch.Insert bl -> BChar.putStrLn bl)
