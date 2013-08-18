@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE NamedFieldPuns     #-}
 {-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 {- |
  Module      :  Main
@@ -25,6 +26,7 @@
 
 module Main(main) where
 
+import           Control.Applicative
 import           Control.Monad
 import           Data.Array.IO
 import           Data.Array.MArray
@@ -35,7 +37,7 @@ import qualified Diffr.Patch            as Patch
 import qualified Diffr.Util             as DU
 import qualified System.Console.CmdArgs as CM
 import           System.Environment     (getArgs, withArgs)
-import System.Exit (exitFailure)
+import           System.Exit            (exitFailure)
 
 main :: IO ()
 main = do
@@ -47,20 +49,25 @@ main = do
         DU.Patch {_originalFile, _patchFile, _pOutFile} -> patch _originalFile _patchFile _pOutFile
 
 patch :: FilePath -> FilePath -> Maybe FilePath -> IO ()
-patch path originalFile _ = do
-    patchFile <- B.readFile path
-    bla <- return (Patch.parsePatch patchFile)
-    case bla of 
+patch originalFile patch _ = do
+    patchFile <- Patch.parsePatch <$> B.readFile patch
+    case patchFile of
         Nothing -> do
-            putStrLn "Unparseable patch"
+            putStrLn "Unparseable patceh"
             exitFailure
-        Just instructions -> do 
+        Just instructions -> do
             file <- BChar.readFile originalFile
-            let indexes = List.zip [1..] . BChar.lines $ file 
+            let indexes = List.zip [1..] . BChar.lines $ file
                 len = length indexes
             arr <- newArray_ (1,len) :: IO (IOArray Int BChar.ByteString)
             forM_ indexes $ (\(i, line) -> do
                 writeArray arr i line)
             forM_ instructions $ (\i -> case i of
-                Patch.Copy left right -> return ()
+                Patch.Copy left right -> 
+--                    if (left < 1 || (right > fromIntegral len))
+--                    then do
+--                        putStrLn "Unparseable patch"
+--                        exitFailure
+--                    else do
+                        forM_ [left+1..right+1] $ (\i -> readArray arr (fromIntegral i) >>= B.putStr >> B.putStr "\n")
                 Patch.Insert bl -> BChar.putStrLn bl)
